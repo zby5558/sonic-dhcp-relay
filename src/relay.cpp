@@ -1353,12 +1353,17 @@ void stress_test_callback(evutil_socket_t fd, short event, void *arg) {
         uint16_t relay_pkt_len = 0;
         auto relay_pkt = relay.MarshalBinary(relay_pkt_len);
         if (relay_pkt && relay_pkt_len > 0) {
+            if (chosen_vlan->state_db) {
+                increase_counter(chosen_vlan->state_db, chosen_vlan->interface, DHCPv6_MESSAGE_TYPE_SOLICIT);
+            }
             int sock = chosen_vlan->gua_sock;
             if (dual_tor_sock) {
                 sock = chosen_vlan->lo_sock;
             }
             for (auto server : chosen_vlan->servers_sock) {
-                send_udp(sock, relay_pkt, server, relay_pkt_len);
+                if (send_udp(sock, relay_pkt, server, relay_pkt_len) && chosen_vlan->state_db) {
+                    increase_counter(chosen_vlan->state_db, chosen_vlan->interface, DHCPv6_MESSAGE_TYPE_RELAY_FORW);
+                }
             }
             args->sent++;
         }
