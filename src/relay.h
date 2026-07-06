@@ -282,7 +282,7 @@ void server_callback_dualtor(evutil_socket_t fd, short event, void *arg);
  * @param vlans         list of vlans retrieved from config_db
  * @param state_db      state_db connector
  */
-void loop_relay(std::unordered_map<std::string, relay_config> &vlans);
+void loop_relay(std::unordered_map<std::string, relay_config> &vlans, int stress_rate = 0, int stress_count = 0);
 
 /**
  * @code signal_init();

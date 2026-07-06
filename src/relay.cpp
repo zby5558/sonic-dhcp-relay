@@ -1229,14 +1229,152 @@ void dhcp6relay_stop()
     event_base_loopexit(base, NULL);
 }
 
+struct stress_test_args {
+    std::unordered_map<std::string, relay_config> *vlans;
+    int rate;
+    int count;
+    int sent;
+    struct event *timer_ev;
+};
+
+void generate_fake_solicit(uint8_t *buf, uint16_t &len, const uint8_t *mac) {
+    buf[0] = 1; // msg_type: Solicit
+    buf[1] = rand() % 256;
+    buf[2] = rand() % 256;
+    buf[3] = rand() % 256;
+    
+    uint16_t offset = 4;
+    
+    // Client ID Option (Option 1)
+    uint16_t opt_clientid_type = htons(1);
+    uint16_t opt_clientid_len = htons(10); // DUID-LL len
+    std::memcpy(buf + offset, &opt_clientid_type, 2);
+    std::memcpy(buf + offset + 2, &opt_clientid_len, 2);
+    
+    uint16_t duid_type = htons(3); // DUID-LL
+    uint16_t hw_type = htons(1); // Ethernet
+    std::memcpy(buf + offset + 4, &duid_type, 2);
+    std::memcpy(buf + offset + 6, &hw_type, 2);
+    std::memcpy(buf + offset + 8, mac, 6);
+    
+    offset += 14;
+    
+    // IA_NA Option (Option 3)
+    uint16_t opt_iana_type = htons(3);
+    uint16_t opt_iana_len = htons(12);
+    std::memcpy(buf + offset, &opt_iana_type, 2);
+    std::memcpy(buf + offset + 2, &opt_iana_len, 2);
+    
+    uint32_t iaid = rand();
+    uint32_t t1 = 0;
+    uint32_t t2 = 0;
+    std::memcpy(buf + offset + 4, &iaid, 4);
+    std::memcpy(buf + offset + 8, &t1, 4);
+    std::memcpy(buf + offset + 12, &t2, 4);
+    
+    offset += 16;
+    
+    len = offset;
+}
+
+void stress_test_callback(evutil_socket_t fd, short event, void *arg) {
+    auto args = reinterpret_cast<stress_test_args *>(arg);
+    
+    static double accumulator = 0;
+    double interval_sec = 0.010; // 10ms
+    accumulator += args->rate * interval_sec;
+    int pkts_to_send = (int)accumulator;
+    accumulator -= pkts_to_send;
+    
+    if (args->count > 0 && args->sent >= args->count) {
+        syslog(LOG_INFO, "Stress test finished. Sent %d packets.", args->sent);
+        event_del(args->timer_ev);
+        return;
+    }
+    
+    for (int i = 0; i < pkts_to_send; i++) {
+        if (args->count > 0 && args->sent >= args->count) {
+            break;
+        }
+        
+        // Find a ready VLAN
+        struct relay_config *chosen_vlan = nullptr;
+        for (auto &kv : *(args->vlans)) {
+            if (kv.second.is_lla_ready && !kv.second.servers_sock.empty() && kv.second.gua_sock > 0) {
+                chosen_vlan = &kv.second;
+                break;
+            }
+        }
+        
+        if (!chosen_vlan) {
+            return;
+        }
+        
+        // Generate fake MAC
+        uint8_t mac[6];
+        for (int j = 0; j < 6; j++) mac[j] = rand() % 256;
+        mac[0] &= 0xfe; // Unicast
+        mac[0] |= 0x02; // Locally administered
+        
+        // Generate fake Solicit
+        uint8_t solicit_buf[256];
+        uint16_t solicit_len = 0;
+        generate_fake_solicit(solicit_buf, solicit_len, mac);
+        
+        // Generate fake IPv6 Src
+        struct in6_addr peer_addr;
+        std::memset(&peer_addr, 0, sizeof(peer_addr));
+        peer_addr.s6_addr[0] = 0xfe;
+        peer_addr.s6_addr[1] = 0x80;
+        for (int j = 8; j < 16; j++) peer_addr.s6_addr[j] = rand() % 256;
+        
+        // Construct RelayMsg
+        RelayMsg relay;
+        relay.m_msg_hdr.msg_type = DHCPv6_MESSAGE_TYPE_RELAY_FORW;
+        relay.m_msg_hdr.hop_count = 0;
+        std::memcpy(&relay.m_msg_hdr.peer_address, &peer_addr, sizeof(in6_addr));
+        std::memcpy(&relay.m_msg_hdr.link_address, &chosen_vlan->link_address.sin6_addr, sizeof(in6_addr));
+        
+        if (chosen_vlan->is_option_79) {
+            option_linklayer_addr option79;
+            option79.link_layer_type = htons(1);
+            std::memcpy(option79.link_layer_addr, mac, 6);
+            relay.m_option_list.Add(OPTION_CLIENT_LINKLAYER_ADDR, (const uint8_t *)&option79, sizeof(option_linklayer_addr));
+        }
+        
+        if (chosen_vlan->is_interface_id) {
+            option_interface_id intf_id;
+            intf_id.interface_id = chosen_vlan->link_address.sin6_addr;
+            relay.m_option_list.Add(OPTION_INTERFACE_ID, (const uint8_t *)&intf_id, sizeof(option_interface_id));
+        }
+        
+        relay.m_option_list.Add(OPTION_RELAY_MSG, solicit_buf, solicit_len);
+        
+        uint16_t relay_pkt_len = 0;
+        auto relay_pkt = relay.MarshalBinary(relay_pkt_len);
+        if (relay_pkt && relay_pkt_len > 0) {
+            int sock = chosen_vlan->gua_sock;
+            if (dual_tor_sock) {
+                sock = chosen_vlan->lo_sock;
+            }
+            for (auto server : chosen_vlan->servers_sock) {
+                send_udp(sock, relay_pkt, server, relay_pkt_len);
+            }
+            args->sent++;
+        }
+    }
+}
+
 /**
- * @code                loop_relay(std::unordered_map<relay_config> &vlans);
+ * @code                loop_relay(std::unordered_map<std::string, relay_config> &vlans, int stress_rate, int stress_count);
  * 
  * @brief               main loop: configure sockets, create libevent base, start server listener thread
  *  
  * @param vlans         list of vlans retrieved from config_db
+ * @param stress_rate   stress test packet rate
+ * @param stress_count  stress test packet count
  */
-void loop_relay(std::unordered_map<std::string, relay_config> &vlans) {
+void loop_relay(std::unordered_map<std::string, relay_config> &vlans, int stress_rate, int stress_count) {
     std::vector<int> sockets;
     base = event_base_new();
     if(base == NULL) {
@@ -1308,6 +1446,26 @@ void loop_relay(std::unordered_map<std::string, relay_config> &vlans) {
     // We set check timer to be executed every 60s, it would case that its first excution be delayed 60s,
     // hence manually invoke it here to immediate execute it
     lla_check_callback(-1, 0, timer_args);
+
+    // If stress rate is enabled, set up stress test timer
+    if (stress_rate > 0) {
+        struct event *stress_timer;
+        struct timeval stress_tv;
+        auto stress_args = new stress_test_args();
+        stress_args->vlans = &vlans;
+        stress_args->rate = stress_rate;
+        stress_args->count = stress_count;
+        stress_args->sent = 0;
+        stress_args->timer_ev = nullptr;
+
+        stress_timer = event_new(base, -1, EV_PERSIST, stress_test_callback, stress_args);
+        stress_args->timer_ev = stress_timer;
+
+        stress_tv.tv_sec = 0;
+        stress_tv.tv_usec = 10000; // 10ms
+        event_add(stress_timer, &stress_tv);
+        syslog(LOG_INFO, "Stress test timer added: rate %d pps, count %d", stress_rate, stress_count);
+    }
 
     if(signal_init() == 0 && signal_start() == 0) {
         shutdown_relay();
