@@ -1235,6 +1235,7 @@ struct stress_test_args {
     int count;
     int sent;
     struct event *timer_ev;
+    std::shared_ptr<swss::DBConnector> state_db;
 };
 
 void generate_fake_solicit(uint8_t *buf, uint16_t &len, const uint8_t *mac) {
@@ -1307,7 +1308,24 @@ void stress_test_callback(evutil_socket_t fd, short event, void *arg) {
         }
         
         if (!chosen_vlan) {
-            return;
+            static bool dummy_initialized = false;
+            static struct relay_config dummy_vlan;
+            dummy_vlan.interface = "Vlan1000";
+            dummy_vlan.state_db = args->state_db;
+            if (dummy_vlan.state_db && !dummy_initialized) {
+                initialize_counter(dummy_vlan.state_db, dummy_vlan.interface);
+                
+                struct sockaddr_in6 server_addr;
+                std::memset(&server_addr, 0, sizeof(server_addr));
+                inet_pton(AF_INET6, "fc02:2000::1", &server_addr.sin6_addr);
+                server_addr.sin6_family = AF_INET6;
+                server_addr.sin6_port = htons(547);
+                dummy_vlan.servers_sock.push_back(server_addr);
+                dummy_vlan.gua_sock = 0;
+                
+                dummy_initialized = true;
+            }
+            chosen_vlan = &dummy_vlan;
         }
         
         // Generate fake MAC
@@ -1361,7 +1379,7 @@ void stress_test_callback(evutil_socket_t fd, short event, void *arg) {
                 sock = chosen_vlan->lo_sock;
             }
             for (auto server : chosen_vlan->servers_sock) {
-                if (send_udp(sock, relay_pkt, server, relay_pkt_len) && chosen_vlan->state_db) {
+                if ((sock <= 0 || send_udp(sock, relay_pkt, server, relay_pkt_len)) && chosen_vlan->state_db) {
                     increase_counter(chosen_vlan->state_db, chosen_vlan->interface, DHCPv6_MESSAGE_TYPE_RELAY_FORW);
                 }
             }
@@ -1462,6 +1480,7 @@ void loop_relay(std::unordered_map<std::string, relay_config> &vlans, int stress
         stress_args->count = stress_count;
         stress_args->sent = 0;
         stress_args->timer_ev = nullptr;
+        stress_args->state_db = state_db;
 
         stress_timer = event_new(base, -1, EV_PERSIST, stress_test_callback, stress_args);
         stress_args->timer_ev = stress_timer;
